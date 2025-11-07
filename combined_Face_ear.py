@@ -1,20 +1,16 @@
 import cv2
 import numpy as np
 import torch
-from facenet_pytorch import MTCNN, InceptionResnetV1
 from ultralytics import YOLO
 from torchvision import transforms
 from torchvision.models import resnet50, ResNet50_Weights
-import mediapipe as mp
+import insightface
+from insightface.app import FaceAnalysis
 from sklearn.metrics.pairwise import cosine_similarity
 import os
 import pickle
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
-
-# Initialize MediaPipe
-mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
 
 class MultimodalBiometricSystem:
     def __init__(self, ear_model_path: str):
@@ -22,18 +18,18 @@ class MultimodalBiometricSystem:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"Using device: {self.device.upper()}")
         
-        # Face components
-        self.mtcnn = MTCNN(
-            keep_all=True,
-            min_face_size=60,
-            thresholds=[0.7, 0.7, 0.8],
-            post_process=False,
-            device=self.device
-        )
-        self.facenet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
-        
-        # Ear components
-        self.ear_detector = YOLO(ear_model_path)
+        # Initialize ArcFace R100
+        self.arcface = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
+        self.arcface.prepare(ctx_id=0, det_size=(640, 640))
+
+        # Load YOLO model for detecting Human Ears
+        try:
+            self.ear_detector = YOLO(ear_model_path) 
+            self.ear_detector.fuse()  # Fuse model layers for optimization
+            self.ear_detector.to(self.device)
+            print("Ear detector model loaded successfully!")
+        except Exception as e:
+            print(f"Error loading ear detector model: {e}")
         self.ear_encoder = self._init_ear_encoder()
         
         # Database
@@ -42,20 +38,15 @@ class MultimodalBiometricSystem:
         self.known_names = []
         self.load_database()
         
-        # Thresholds (adjust based on your validation)
-        self.FACE_THRESHOLD = 0.65    # Minimum similarity for face recognition
-        self.EAR_THRESHOLD = 0.70     # Minimum similarity for ear recognition
-        self.CONFIRMATION_THRESHOLD = 0.85  # Combined threshold
-        
-        # Confidence levels
-        self.FACE_CONFIDENCE = 0.70   # Confidence when only face matches
-        self.EAR_CONFIDENCE = 0.75    # Confidence when only ear matches
-        self.COMBINED_CONFIDENCE = 0.98  # Confidence when both match
+        # Thresholds
+        self.FACE_THRESHOLD = 0.35  # ArcFace generally needs lower threshold
+        self.EAR_THRESHOLD = 0.50
+        self.COMBINED_CONFIDENCE = 0.98
 
     def _init_ear_encoder(self):
-        """Initialize ear feature extractor using ResNet50"""
+        """Initialize ResNet50 for ear feature extraction"""
         model = resnet50(weights=ResNet50_Weights.DEFAULT)
-        model = torch.nn.Sequential(*(list(model.children())[:-1]))  # Remove final layer
+        model = torch.nn.Sequential(*(list(model.children())[:-1]))
         model.eval().to(self.device)
         
         preprocess = transforms.Compose([
@@ -72,6 +63,7 @@ class MultimodalBiometricSystem:
         """Load registered biometrics from database"""
         if not os.path.exists("biometric_database"):
             os.makedirs("biometric_database")
+            return
             
         self.known_face_embeddings = []
         self.known_ear_embeddings = []
@@ -79,176 +71,182 @@ class MultimodalBiometricSystem:
         
         for filename in os.listdir("biometric_database"):
             if filename.endswith('.pkl'):
-                with open(os.path.join("biometric_database", filename), 'rb') as f:
-                    data = pickle.load(f)
-                    self.known_face_embeddings.append(data['face_embedding'])
-                    self.known_ear_embeddings.append(data['ear_embedding'])
-                    self.known_names.append(data['name'])
+                try:
+                    with open(os.path.join("biometric_database", filename), 'rb') as f:
+                        data = pickle.load(f)
+                        if 'face_embedding' in data and 'ear_embedding' in data and 'name' in data:
+                            self.known_face_embeddings.append(data['face_embedding'])
+                            self.known_ear_embeddings.append(data['ear_embedding'])
+                            self.known_names.append(data['name'])
+                except Exception as e:
+                    print(f"Error loading {filename}: {str(e)}")
 
-    def register_person(self, name: str):
-        """Fixed registration with proper array handling and error checking"""
-        cap = None
-        try:
-            # Try multiple camera indexes
-            for cam_idx in [0, 1, 2]:
-                cap = cv2.VideoCapture(cam_idx)
-                if cap.isOpened():
-                    print(f"Using camera index {cam_idx}")
-                    break
-            else:
-                print("Error: Could not open any camera")
-                return False
+    def register_person(self, name: str) -> bool:
+        """Register a new person with face and ear samples"""
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Error: Could not open camera")
+            return False
 
-            angles = [
-                {"name": "Frontal face", "samples": [], "target": 7},
-                {"name": "Left profile", "samples": [], "target": 7},
-                {"name": "Right profile", "samples": [], "target": 7},
-                {"name": "Upward angle", "samples": [], "target": 7},
-                {"name": "Downward angle", "samples": [], "target": 7}
-            ]
-            current_angle = 0
-            ear_samples = []
-            
-            print(f"\n=== Registering {name} ===")
-            print("Press 'c' to capture, 'n' for next angle, 'q' to quit")
+        face_samples = []
+        ear_samples = []
+        sample_count = 0
+        required_samples = 5  # One sample for each direction: frontal, left, right, up, down
 
-            while current_angle < len(angles):
+        angles = ['frontal', 'left', 'right', 'up', 'down']
+        
+        print(f"Registering {name}. Please move your head to capture different angles.")
+
+        for angle in angles:
+            while cap.isOpened() and sample_count < len(angles):
                 ret, frame = cap.read()
                 if not ret:
-                    print("Warning: Failed to grab frame")
                     continue
 
                 # Display instructions
                 display_frame = frame.copy()
-                status_text = f"{angles[current_angle]['name']} [{len(angles[current_angle]['samples'])}/{angles[current_angle]['target']}]"
-                cv2.putText(display_frame, status_text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(display_frame, "Press: c-capture | n-next | q-quit", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+                cv2.putText(display_frame, f"Sample {sample_count+1}/{len(angles)}", 
+                            (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(display_frame, f"Move your head to {angle}", 
+                            (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+                cv2.putText(display_frame, "Press 'c' to capture, 'q' to quit", 
+                            (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
 
-                # Process detections
+                # Process face and ears
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                faces = self.arcface.get(rgb_frame)
                 
-                # Face detection with proper return handling
-                face_result = self._process_face(rgb_frame, return_box=True)
-                face_box = face_result[1] if face_result else None
-                face_embedding = face_result[0] if face_result else None
-                
-                # Ear detection with proper return handling
-                ear_result = self._process_ears(rgb_frame, return_boxes=True)
-                ear_boxes = ear_result[1] if ear_result else []
-                ear_embeddings = ear_result[0] if ear_result else []
-                
-                # Draw detections
-                if face_box is not None:
-                    x1, y1, x2, y2 = map(int, face_box)
+                # Draw face detections
+                if faces:
+                    face = faces[0]  # Take the most prominent face
+                    x1, y1, x2, y2 = face.bbox.astype(int)
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                for box in ear_boxes:
-                    x1, y1, x2, y2 = map(int, box)
+
+                # Process ears
+                ear_results = self.ear_detector(rgb_frame, verbose=False)
+                for box in ear_results[0].boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
                     cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                
+
                 cv2.imshow(f"Registering {name}", display_frame)
                 key = cv2.waitKey(1) & 0xFF
 
                 if key == ord('q'):
-                    print("Registration cancelled")
-                    break
-                    
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    return False
                 elif key == ord('c'):
-                    if face_embedding is not None and len(angles[current_angle]['samples']) < angles[current_angle]['target']:
-                        angles[current_angle]['samples'].append(face_embedding)
-                        print(f"Captured {angles[current_angle]['name']} sample {len(angles[current_angle]['samples'])}")
-                    
-                    if ear_embeddings:
-                        ear_samples.extend(ear_embeddings)
-                        print(f"Captured {len(ear_embeddings)} ear samples")
-                
-                elif key == ord('n'):
-                    if len(angles[current_angle]['samples']) >= angles[current_angle]['target']:
-                        current_angle += 1
-                        if current_angle < len(angles):
-                            print(f"Now capturing: {angles[current_angle]['name']}")
-                    else:
-                        needed = angles[current_angle]['target'] - len(angles[current_angle]['samples'])
-                        print(f"Need {needed} more {angles[current_angle]['name']} samples")
+                    if faces:
+                        face_samples.append(faces[0].embedding)
+                        sample_count += 1
+                        print(f"Captured {angle} sample {sample_count}/{len(angles)}")
+                        break  # Move to next angle after capture
 
-        except Exception as e:
-            print(f"Registration error: {str(e)}")
-            return False
-        
-        finally:
-            if cap and cap.isOpened():
-                cap.release()
-            cv2.destroyAllWindows()
+        cap.release()
+        cv2.destroyAllWindows()
+
+        if len(face_samples) >= 3:  # Require at least 3 good samples
+            avg_face = np.mean(face_samples, axis=0)
             
-            # Combine all face samples
-            all_face_samples = []
-            for angle in angles:
-                all_face_samples.extend(angle['samples'])
+            # Get ear samples from the last frame (if any)
+        if ear_results:
+            print(f"Ear detections found: {len(ear_results[0].boxes)}")
+            for box in ear_results[0].boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                print(f"Ear box coordinates: {x1},{y1} - {x2},{y2}")
+                
+                # Ensure coordinates are valid
+                if x2 <= x1 or y2 <= y1:
+                    print("Invalid ear box coordinates!")
+                    continue
+                    
+                ear_img = rgb_frame[y1:y2, x1:x2]
+                print(f"Ear image shape: {ear_img.shape}")
+                
+                if ear_img.size > 0 and ear_img.shape[0] > 10 and ear_img.shape[1] > 10:
+                    ear_embedding = self.encode_ear(ear_img)
+                    print(f"Encoding successful: {ear_embedding is not None}")
+                    
+                    if ear_embedding is not None:
+                        ear_samples.append(ear_embedding)
+                        print(f"Ear sample added. Total samples: {len(ear_samples)}")
+                        print(f"Sample shape: {ear_embedding.shape}")
+                else:
+                    print("Empty or too small ear image")
+        else:
+            print("No ear detections in this frame")
             
-            if len(all_face_samples) >= 10 and len(ear_samples) >= 10:
-                self._save_to_database(name, all_face_samples, ear_samples)
-                print(f"Successfully registered {name}!")
-                return True
-            else:
-                print(f"Failed to register. Got {len(all_face_samples)} face and {len(ear_samples)} ear samples")
-                return False
-        
+            avg_ear = np.mean(ear_samples, axis=0) if ear_samples else np.zeros(2048)  # Default if no ears
+
+            data = {
+                'name': name,
+                'face_embedding': avg_face,
+                'ear_embedding': avg_ear,
+                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
+            }
+
+            filename = f"biometric_database/{name}_{data['timestamp']}.pkl"
+            with open(filename, 'wb') as f:
+                pickle.dump(data, f)
+
+            self.load_database()  # Refresh database
+            print(f"Successfully registered {name}!")
+            return True
+        # else:
+        #     print(f"Registration failed. Got {len(face_samples)} face samples")
+        #     return False
+
     def recognize_person(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Dict]]:
-        """Recognize person using multimodal biometrics"""
+        """Recognize a person in the given frame"""
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         output_frame = frame.copy()
         results = []
         
         # Process face
-        face_embedding, face_box = self._process_face(rgb_frame, return_box=True)
+        face_embeddings, face_boxes = self._process_face(rgb_frame, return_box=True)
         
         # Process ears
         ear_embeddings, ear_boxes = self._process_ears(rgb_frame, return_boxes=True)
         
         # Multimodal matching
-        if face_embedding is not None or ear_embeddings:
-            match_result = self._multimodal_match(face_embedding, ear_embeddings)
-            if match_result:
-                results.append(match_result)
+        if face_embeddings:
+            for i, face_embedding in enumerate(face_embeddings):
+                match_result = self._multimodal_match(face_embedding, ear_embeddings)
+                if match_result:
+                    results.append(match_result)
+                    # Draw face box with recognition result
+                    if i < len(face_boxes):
+                        x1, y1, x2, y2 = face_boxes[i]
+                        color = (0, 255, 0) if match_result['name'] != 'Unknown' else (0, 0, 255)
+                        cv2.rectangle(output_frame, (x1, y1), (x2, y2), color, 2)
+                        text = f"{match_result['name']} ({match_result['confidence']*100:.1f}%)"
+                        cv2.putText(output_frame, text, (x1, y1 - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
         
-        # Visualize results
-        output_frame = self._draw_recognition_results(output_frame, face_box, ear_boxes, results)
+        # Draw ear boxes
+        for box in ear_boxes:
+            x1, y1, x2, y2 = box
+            cv2.rectangle(output_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        
         return output_frame, results
 
     def _process_face(self, rgb_frame: np.ndarray, return_box: bool = False):
-        """Detect and extract face features"""
+        """Use ArcFace for face detection and embedding"""
         try:
-            boxes, probs = self.mtcnn.detect(rgb_frame)
-            if boxes is None or len(boxes) == 0:
+            faces = self.arcface.get(rgb_frame)
+            if not faces:
                 return (None, None) if return_box else None
-                
-            best_idx = np.argmax(probs)
-            if probs[best_idx] < 0.8:  # Confidence threshold
-                return (None, None) if return_box else None
-                
-            x1, y1, x2, y2 = map(int, boxes[best_idx])
-            face_region = rgb_frame[y1:y2, x1:x2]
             
-            # Get face tensor
-            face_tensor = self.mtcnn(face_region)
-            if face_tensor is None:
-                return (None, None) if return_box else None
-                
-            if face_tensor.dim() == 3:
-                face_tensor = face_tensor.unsqueeze(0)
-                
-            # Extract embedding
-            embedding = self.facenet(face_tensor.to(self.device))
-            embedding = embedding.detach().cpu().numpy().flatten()
+            embeddings = [face.embedding for face in faces]
+            boxes = [face.bbox.astype(int) for face in faces]
             
-            return (embedding, (x1, y1, x2, y2)) if return_box else embedding
-            
+            return (embeddings, boxes) if return_box else embeddings
         except Exception as e:
             print(f"Face processing error: {e}")
             return (None, None) if return_box else None
 
     def _process_ears(self, rgb_frame: np.ndarray, return_boxes: bool = False):
-        """Detect and extract ear features"""
+        """Detect ears and extract features"""
         try:
             ear_results = self.ear_detector(rgb_frame, verbose=False)
             embeddings = []
@@ -261,14 +259,12 @@ class MultimodalBiometricSystem:
                 if ear_img.size == 0:
                     continue
                     
-                # Extract ear features
                 embedding = self.encode_ear(ear_img)
                 if embedding is not None:
                     embeddings.append(embedding)
                     boxes.append((x1, y1, x2, y2))
             
             return (embeddings, boxes) if return_boxes else embeddings
-            
         except Exception as e:
             print(f"Ear processing error: {e}")
             return ([], []) if return_boxes else []
@@ -281,151 +277,104 @@ class MultimodalBiometricSystem:
             
             with torch.no_grad():
                 features = self.ear_encoder['model'](input_batch)
-            return features.squeeze().cpu().numpy()
-        except:
+            return features.squeeze().cpu().numpy().flatten()
+        except Exception as e:
+            print(f"Ear encoding error: {e}")
             return None
 
-    def _multimodal_match(self, face_embedding: Optional[np.ndarray], 
-                         ear_embeddings: List[np.ndarray]) -> Optional[Dict]:
-        """Fuse face and ear recognition results with confidence boosting"""
-        face_match = self._match_face(face_embedding) if face_embedding is not None else None
-        ear_match = self._match_ear(ear_embeddings) if ear_embeddings else None
+    def _multimodal_match(self, face_embedding: np.ndarray, 
+                         ear_embeddings: List[np.ndarray]) -> Dict:
+        """Fuse face and ear recognition results"""
+        face_match = self._match_face(face_embedding)
+        ear_match = self._match_ear(ear_embeddings) if ear_embeddings else {'name': 'Unknown', 'similarity': 0.0}
         
         # Case 1: Both modalities agree
-        if face_match and ear_match and face_match['name'] == ear_match['name']:
+        if (face_match['name'] != 'Unknown' and ear_match['name'] != 'Unknown' and 
+            face_match['name'] == ear_match['name']):
+            combined_conf = min(1.0, (face_match['similarity'] + ear_match['similarity']) / 2)
             return {
                 'name': face_match['name'],
-                'confidence': self.COMBINED_CONFIDENCE,
+                'confidence': combined_conf,
                 'modality': 'face+ear',
                 'face_similarity': face_match['similarity'],
                 'ear_similarity': ear_match['similarity']
             }
+    
         
         # Case 2: Only face matches
-        elif face_match:
+        elif face_match['name'] != 'Unknown':
             return {
                 'name': face_match['name'],
-                'confidence': self.FACE_CONFIDENCE,
+                'confidence': face_match['similarity'],
                 'modality': 'face',
                 'face_similarity': face_match['similarity'],
                 'ear_similarity': None
             }
         
         # Case 3: Only ear matches
-        elif ear_match:
+        elif ear_match['name'] != 'Unknown':
             return {
                 'name': ear_match['name'],
-                'confidence': self.EAR_CONFIDENCE,
+                'confidence': ear_match['similarity'],
                 'modality': 'ear',
                 'face_similarity': None,
                 'ear_similarity': ear_match['similarity']
             }
         
-        return None
+        # Case 4: No matches
+        return {
+            'name': 'Unknown',
+            'confidence': 0.0,
+            'modality': 'none',
+            'face_similarity': face_match['similarity'],
+            'ear_similarity': ear_match['similarity']
+        }
 
-    def _match_face(self, embedding: np.ndarray) -> Optional[Dict]:
+    def _match_face(self, embedding: np.ndarray) -> Dict:
         """Match face against database"""
         if not self.known_face_embeddings:
-            return None
-            
-        similarities = cosine_similarity([embedding], self.known_face_embeddings)[0]
+            return {'name': 'Unknown', 'similarity': 0.0}
+        
+        embedding = embedding.flatten()
+        similarities = cosine_similarity([embedding], np.array(self.known_face_embeddings))[0]
         max_idx = np.argmax(similarities)
+        
+        if max_idx >= len(self.known_names):
+            return {'name': 'Unknown', 'similarity': 0.0}
+            
         max_sim = similarities[max_idx]
         
-        if max_sim > self.FACE_THRESHOLD:
-            return {
-                'name': self.known_names[max_idx],
-                'similarity': max_sim
-            }
-        return None
+        return {
+            'name': self.known_names[max_idx] if max_sim >= self.FACE_THRESHOLD else 'Unknown',
+            'similarity': max_sim
+        }
 
-    def _match_ear(self, embeddings: List[np.ndarray]) -> Optional[Dict]:
+    def _match_ear(self, embeddings: List[np.ndarray]) -> Dict:
         """Match ears against database"""
-        if not self.known_ear_embeddings:
-            return None
+        if not self.known_ear_embeddings or not embeddings:
+            return {'name': 'Unknown', 'similarity': 0.0}
             
-        # Compare each ear with all known ears
         best_sim = -1
         best_idx = -1
         
-        for ear_embedding in embeddings:
-            similarities = cosine_similarity([ear_embedding], self.known_ear_embeddings)[0]
+        for emb in embeddings:
+            similarities = cosine_similarity([emb], np.array(self.known_ear_embeddings))[0]
             current_max = np.max(similarities)
             if current_max > best_sim:
                 best_sim = current_max
                 best_idx = np.argmax(similarities)
         
-        if best_sim > self.EAR_THRESHOLD:
-            return {
-                'name': self.known_names[best_idx],
-                'similarity': best_sim
-            }
-        return None
-
-    def _save_to_database(self, name: str, face_samples: List[np.ndarray], 
-                         ear_samples: List[np.ndarray]):
-        """Save averaged embeddings to database"""
-        avg_face = np.mean(face_samples, axis=0)
-        avg_ear = np.mean(ear_samples, axis=0)
-        
-        data = {
-            'name': name,
-            'face_embedding': avg_face,
-            'ear_embedding': avg_ear,
-            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
-            'face_samples': len(face_samples),
-            'ear_samples': len(ear_samples)
-        }
-        
-        filename = f"biometric_database/{name}_{data['timestamp']}.pkl"
-        with open(filename, 'wb') as f:
-            pickle.dump(data, f)
-        
-        self.load_database()  # Refresh database
-
-    def _draw_recognition_results(self, frame: np.ndarray, 
-                                face_box: Optional[Tuple], ear_boxes: List[Tuple], 
-                                results: List[Dict]) -> np.ndarray:
-        """Draw recognition results on frame"""
-        display = frame.copy()
-        
-        # Draw face box (green)
-        if face_box:
-            x1, y1, x2, y2 = face_box
-            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        
-        # Draw ear boxes (blue)
-        for box in ear_boxes:
-            x1, y1, x2, y2 = box
-            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        
-        # Draw recognition info
-        for result in results:
-            # Determine color based on confidence
-            if result['confidence'] >= 0.9:
-                color = (0, 255, 0)  # Green for high confidence
-            elif result['confidence'] > 0.7:
-                color = (0, 255, 255)  # Yellow for medium
-            else:
-                color = (0, 0, 255)  # Red for low
-                
-            text = f"{result['name']} {result['confidence']*100:.0f}% ({result['modality']})"
+        if best_idx == -1 or best_idx >= len(self.known_names):
+            return {'name': 'Unknown', 'similarity': 0.0}
             
-            # Position text above face box if available, else top of frame
-            if face_box:
-                x1, y1, _, _ = face_box
-                y = max(20, y1 - 10)
-            else:
-                x1, y = 20, 30
-                
-            cv2.putText(display, text, (x1, y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        
-        return display
+        return {
+            'name': self.known_names[best_idx] if best_sim >= self.EAR_THRESHOLD else 'Unknown',
+            'similarity': best_sim
+        }
 
 def main():
-    # Initialize system with your ear detection model
-    system = MultimodalBiometricSystem("ear_detection_yolo.pt")  # Path to your YOLOv8 ear model
+    # Initialize system with ear detection model
+    system = MultimodalBiometricSystem("best_3.pt")  # Path to your YOLOv8 ear model
     
     while True:
         print("\n==== Multimodal Biometric System ====")
@@ -448,6 +397,10 @@ def main():
         
         elif choice == '2':
             cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("Error: Could not open camera")
+                continue
+                
             print("Starting recognition... Press Q to quit")
             
             while cap.isOpened():
@@ -456,11 +409,13 @@ def main():
                     break
                 
                 frame, results = system.recognize_person(frame)
-                cv2.imshow("Multimodal Recognition", frame)
+                cv2.imshow("Recognition", frame)
                 
-                # Print results to console
                 for result in results:
-                    print(f"Recognized: {result['name']} ({result['confidence']*100:.0f}% confidence)")
+                    if result['name'] == 'Unknown':
+                        print("Unknown person detected")
+                    else:
+                        print(f"Recognized: {result['name']} ({result['confidence']*100:.1f}%)")
                 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -470,9 +425,10 @@ def main():
         
         elif choice == '3':
             print("\nRegistered Persons:")
-            for name in system.known_names:
+            unique_names = list(set(system.known_names))
+            for name in unique_names:
                 print(f"- {name}")
-            print(f"\nTotal: {len(system.known_names)} persons")
+            print(f"\nTotal: {len(unique_names)} persons")
         
         elif choice == '4':
             print("Exiting...")
